@@ -11,7 +11,7 @@
 
 # _MuViT_: Multi-Resolution Vision Transformers for Learning Across Scales in Microscopy 
 
-Official implementation of _MuViT_ (CVPR 2026), a vision transformer architecture that fuses true multi-resolution observations from the same image within a single encoder, for large-scale microscopy analysis. For technical details check the [preprint](https://doi.org/10.48550/arXiv.2602.24222).
+Official implementation of _MuViT_ (CVPR 2026, Highlight), a vision transformer architecture that fuses true multi-resolution observations from the same image within a single encoder, for large-scale microscopy analysis. For technical details check the [manuscript](https://openaccess.thecvf.com/content/CVPR2026/papers/Mantes_MuViT_Multi-Resolution_Vision_Transformers_for_Learning_Across_Scales_in_Microscopy_CVPR_2026_paper.pdf).
 
 This repository contains the implementation of the _MuViT_ architecture, along with the multi-resolution Masked Autoencoder (MAE) pre-training framework.
 
@@ -131,13 +131,12 @@ The method `compute_features()` of an encoder will run a forward pass on a given
 If you use this code for your research, please cite the following article:
 
 ```
-@misc{dominguezmantes2026muvit,
-      title={MuViT: Multi-Resolution Vision Transformers for Learning Across Scales in Microscopy}, 
-      author={Albert Dominguez Mantes and Gioele La Manno and Martin Weigert},
-      year={2026},
-      eprint={2602.24222},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2602.24222}, 
+@InProceedings{Mantes_2026_CVPR,
+    author    = {Mantes, Albert Dominguez and La Manno, Gioele and Weigert, Martin},
+    title     = {MuViT: Multi-Resolution Vision Transformers for Learning Across Scales in Microscopy},
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    month     = {June},
+    year      = {2026},
+    pages     = {13648-13657}
 }
 ```
