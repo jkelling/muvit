@@ -124,7 +124,6 @@ class MuViTEncoder(SaveableModel, ABC, Generic[T]):
             ]
         )
 
-    @classmethod
     @property
     @abstractmethod
     def ndim(self) -> int:
@@ -441,7 +440,6 @@ class MuViTEncoder(SaveableModel, ABC, Generic[T]):
 
 
 class MuViTEncoder2d(MuViTEncoder[Tuple[int, int]]):
-    @classmethod
     @property
     def ndim(self) -> int: # FIXME: breaks in py313 as classmethod+properties are deprecated
         return 2
@@ -550,7 +548,6 @@ class MuViTEncoder2d(MuViTEncoder[Tuple[int, int]]):
 
 
 class MuViTEncoder3d(MuViTEncoder[Tuple[int, int, int]]):
-    @classmethod
     @property
     def ndim(self) -> int:
         return 3
@@ -666,7 +663,6 @@ class MuViTEncoder3d(MuViTEncoder[Tuple[int, int, int]]):
 
 
 class MuViTEncoder4d(MuViTEncoder[Tuple[int, int, int]]):
-    @classmethod
     @property
     def ndim(self) -> int:
         return 4

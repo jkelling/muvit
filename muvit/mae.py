@@ -490,20 +490,27 @@ class MuViTMAE(SaveableModel, ABC, Generic[T]):
             if self.mask_token is not None:
                 new_mae.mask_token = nn.Parameter(self.mask_token.data[:, level_indices, :].clone())
         return new_mae
-   
+
+    def to_pipeline(self, num_stages: int):
+        """Build pipeline-parallel stages from this model.
+
+        See :mod:`muvit.pipeline` for the supported stage counts and the
+        exact stage boundaries. The returned stages reference this model's
+        parameters in place.
+        """
+        from .pipeline import build_mae3d_pipeline
+        return build_mae3d_pipeline(self, num_stages)
+
 
 class MuViTMAE2d(MuViTMAE[Tuple[int, int]]):
-    @classmethod
     @property
     def ndim(self) -> int:
         return 2
 
-    @classmethod
     @property
     def encoder_class(self) -> Type[MuViTEncoder]:
         return MuViTEncoder2d
 
-    @classmethod
     @property
     def decoder_class(self) -> Type[MuViTDecoder]:
         return MuViTDecoder2d
@@ -533,17 +540,14 @@ class MuViTMAE2d(MuViTMAE[Tuple[int, int]]):
 
 
 class MuViTMAE3d(MuViTMAE[Tuple[int, int, int]]):
-    @classmethod
     @property
     def ndim(self) -> int:
         return 3
 
-    @classmethod
     @property
     def encoder_class(self) -> Type[MuViTEncoder]:
         return MuViTEncoder3d
 
-    @classmethod
     @property
     def decoder_class(self) -> Type[MuViTDecoder]:
         return MuViTDecoder3d
@@ -575,17 +579,14 @@ class MuViTMAE3d(MuViTMAE[Tuple[int, int, int]]):
 
 
 class MuViTMAE4d(MuViTMAE[Tuple[int, int, int]]):
-    @classmethod
     @property
     def ndim(self) -> int:
         return 4
 
-    @classmethod
     @property
     def encoder_class(self) -> Type[MuViTEncoder]:
         return MuViTEncoder4d
 
-    @classmethod
     @property
     def decoder_class(self) -> Type[MuViTDecoder]:
         return MuViTDecoder4d

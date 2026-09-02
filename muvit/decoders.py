@@ -113,7 +113,6 @@ class MuViTDecoder(SaveableModel, ABC, Generic[T]):
                 x = layer(x, coords=coords, attention_mode=self.attention_mode)
         return x
     
-    @classmethod
     @property
     @abstractmethod
     def ndim(self) -> int:
@@ -122,19 +121,16 @@ class MuViTDecoder(SaveableModel, ABC, Generic[T]):
 
 
 class MuViTDecoder2d(MuViTDecoder[Tuple[int, int]]):
-    @classmethod
     @property
     def ndim(self) -> int: # FIXME: deprecated in py313
         return 2
 
 class MuViTDecoder3d(MuViTDecoder[Tuple[int, int, int]]):
-    @classmethod
     @property
     def ndim(self) -> int: # FIXME: deprecated in py313
         return 3
 
 class MuViTDecoder4d(MuViTDecoder[Tuple[int, int, int]]):
-    @classmethod
     @property
     def ndim(self) -> int: # FIXME: deprecated in py313
         return 4
