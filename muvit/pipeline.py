@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -52,21 +53,49 @@ def _forward_masked(mae, x, bbox):
     )
 
 
+def _stage_rank(data_rank: int, num_stages: int) -> Tuple[int, int]:
+    """Return (first_stage_rank, last_stage_rank) of a data-parallel replica.
+
+    With a DeepSpeed topology of ``axes=['data', 'pipe']`` and
+    ``dims=[D, P]`` the row-major rank layout is ``rank = data*P + pipe``.
+    """
+    first = data_rank * num_stages
+    return first, first + num_stages - 1
+
+
 class EncoderStage(nn.Module):
     """Pipeline stage 0: encode the (multi-level) input and sample the mask.
 
     Input:  ``(x, bbox)`` (the pyramid built by ``MuViTMaeRepo.build_pyramid``
     and its bounding box, or ``None`` bbox).
     Output: ``(y, coords, patches, batch_range, idx_retain, idx_mask)``.
+
+    The reconstructed target (the input patches) is additionally shipped
+    asynchronously with ``dist.isend`` to the last pipeline stage, which needs
+    it for the reconstruction MSE loss. ``drain()`` must be called after each
+    ``train_batch`` to reap the send handles.
     """
 
     def __init__(self, mae):
         super().__init__()
         self.mae = mae
+        self.target_dest: Optional[int] = None
+        self._pending: list = []
 
     def forward(self, x_bbox):
         x, bbox = x_bbox
-        return _forward_masked(self.mae, x, bbox)
+        y, coords, patches, batch_range, idx_retain, idx_mask = _forward_masked(
+            self.mae, x, bbox)
+        if self.target_dest is not None:
+            self._pending.append(
+                dist.isend(patches.contiguous(), dst=self.target_dest))
+        return y, coords, patches, batch_range, idx_retain, idx_mask
+
+    def drain(self):
+        """Wait for all outstanding target sends to complete."""
+        pending, self._pending = self._pending, []
+        for handle in pending:
+            handle.wait()
 
 
 def _assemble_z(self, y, coords, patches, batch_range, idx_retain, idx_mask):
@@ -136,15 +165,35 @@ class DecodeStage(nn.Module):
 
 
 class FinalLossStage(nn.Module):
-    """Pipeline stage: project to patch space, normalise and compute the loss."""
+    """Pipeline stage: project to patch space, normalise and compute the loss.
+
+    The reconstruction target is *not* carried through the pipeline state
+    (which would blow up activation memory); instead it is received from the
+    first pipeline stage via an asynchronous ``dist.irecv`` (posted there with
+    ``dist.isend``). The loss is the MSE between the reconstructed tokens and
+    this input-derived target over the masked token positions.
+
+    ``target_source`` (rank of the first stage of this replica) is set by the
+    pipeline driver (The-Recycler). If it is ``None`` / no process group is
+    available, the carried ``patches`` from the encoder state are used as
+    fallback.
+    """
 
     def __init__(self, mae, eps: float = 1e-2):
         super().__init__()
         self.mae = mae
         self.eps = eps
+        self.target_source: Optional[int] = None
 
     def forward(self, state):
         z, patches, batch_range, idx_mask = state
+
+        if (self.target_source is not None and dist.is_available()
+                and dist.is_initialized()):
+            target = torch.empty_like(z)
+            dist.irecv(target, src=self.target_source).wait()
+            patches = target
+
         z = self.mae.final(z)
 
         if self.mae.loss_fn == "norm_mse":
