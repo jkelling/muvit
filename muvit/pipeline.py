@@ -91,15 +91,18 @@ class EncoderStage(nn.Module):
         # DeepSpeed's inter-stage gradient pass requires every *floating point*
         # output of this stage to require grad (e.g. the grid coordinates are
         # usually grad-free by construction).
-        for t in (y, coords):
+        for t in (y, coords, patches):
             if t.dtype.is_floating_point and not t.requires_grad:
                 t = t.requires_grad_()
         N = torch.tensor(patches.shape[1], device=y.device, dtype=torch.long)
         # DeepSpeed's inter-stage activation P2P requires dense, non-overlapping
         # tensors (the encoder output contains advanced-indexing views), so make
-        # everything contiguous before handing it across the pipeline.
-        return (y.contiguous(), coords.contiguous(), N, batch_range.contiguous(),
-                idx_retain.contiguous(), idx_mask.contiguous())
+        # everything contiguous before handing it across the pipeline. `patches`
+        # are carried so the last stage can compute MSE(input, output) with a
+        # target that is consistent across ranks by construction.
+        return (y.contiguous(), coords.contiguous(), patches.contiguous(), N,
+                batch_range.contiguous(), idx_retain.contiguous(),
+                idx_mask.contiguous())
 
     def drain(self):
         """Wait for all outstanding target sends to complete."""
@@ -134,26 +137,25 @@ class AssembleStage(nn.Module):
         self.device = None
 
     def forward(self, enc_state):
-        y, coords, N, batch_range, idx_retain, idx_mask = enc_state
-        self.device = y.device
+        y, coords, patches, N, batch_range, idx_retain, idx_mask = enc_state
         Ni = int(N.item())
         N_per_level = Ni // len(self.mae.encoder.levels)
         z = _assemble_z(self.mae, y, coords, Ni, N_per_level, batch_range,
                         idx_retain, idx_mask)
-        return (z, coords,
+        return (z, coords, patches,
                 torch.tensor(N_per_level, device=y.device, dtype=torch.long),
                 batch_range, idx_mask)
 
 
 class DecodeStage(nn.Module):
-    """Pipeline stage: run the MAE decoder(s); returns decoder tokens ``z``."""
+    """Pipeline stage: run the MAE decoder(s); returns ``(decoded, patches)``."""
 
     def __init__(self, mae):
         super().__init__()
         self.mae = mae
 
     def forward(self, state):
-        z, coords, N_per_level, _batch_range, _idx_mask = state
+        z, coords, patches, N_per_level, _batch_range, _idx_mask = state
         npl = int(N_per_level.item())
         if self.mae.decoder_mode == "single":
             z = self.mae.decoder(z, coords)
@@ -177,15 +179,16 @@ class DecodeStage(nn.Module):
             )
         else:
             raise ValueError(f"Invalid decoder mode: {self.mae.decoder_mode}")
-        return z
+        return z, patches
 
 
 class FinalLossStage(nn.Module):
     """Final pipeline stage: project decoder tokens to patch space.
 
-    Returns the (differentiable) decoder output ``z``; the reconstruction MSE
-    against the input-derived target patches (arriving as DeepSpeed labels) is
-    computed by :func:`mae_pipeline_loss`.
+    Returns ``(z, patches)`` -- the (differentiable) decoder output and the
+    input-derived target patches carried through the pipeline state -- so the
+    raw reconstruction MSE between input and output is computed on the last
+    stage by :func:`mae_pipeline_loss` (DeepSpeed ``loss_fn``).
     """
 
     def __init__(self, mae, eps: float = 1e-2):
@@ -195,14 +198,19 @@ class FinalLossStage(nn.Module):
         self.target_source: Optional[int] = None
         self.target_group: Optional[dist.ProcessGroup] = None
 
-    def forward(self, z):
-        return self.mae.final(z)
+    def forward(self, state):
+        z, patches = state
+        return self.mae.final(z), patches
 
 
 def mae_pipeline_loss(output, labels):
-    """DeepSpeed pipeline ``loss_fn``: MSE between decoder output and the
-    input-derived target patches (delivered by DeepSpeed as ``labels``)."""
-    return F.mse_loss(output, labels.detach())
+    """DeepSpeed pipeline ``loss_fn``: MSE between the decoder output and the
+    input-derived target patches carried through the pipeline state. ``labels``
+    are ignored (DeepSpeed still delivers them from each stage's data iterator
+    on every rank) because the target already travels inside ``output``, which
+    keeps input and output consistent across ranks by construction."""
+    z, patches = output
+    return F.mse_loss(z, patches)
 
 
 class AssembleDecodeStage(nn.Module):
