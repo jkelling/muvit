@@ -80,6 +80,7 @@ class EncoderStage(nn.Module):
         super().__init__()
         self.mae = mae
         self.target_dest: Optional[int] = None
+        self.target_group: Optional[dist.ProcessGroup] = None
         self._pending: list = []
 
     def forward(self, x_bbox):
@@ -88,7 +89,9 @@ class EncoderStage(nn.Module):
             self.mae, x, bbox)
         if self.target_dest is not None:
             self._pending.append(
-                dist.isend(patches.contiguous(), dst=self.target_dest))
+                dist.isend(patches.contiguous(),
+                           dst=self.target_dest,
+                           group=self.target_group))
         return y, coords, patches, batch_range, idx_retain, idx_mask
 
     def drain(self):
@@ -184,6 +187,7 @@ class FinalLossStage(nn.Module):
         self.mae = mae
         self.eps = eps
         self.target_source: Optional[int] = None
+        self.target_group: Optional[dist.ProcessGroup] = None
 
     def forward(self, state):
         z, patches, batch_range, idx_mask = state
@@ -191,7 +195,9 @@ class FinalLossStage(nn.Module):
         if (self.target_source is not None and dist.is_available()
                 and dist.is_initialized()):
             target = torch.empty_like(z)
-            dist.irecv(target, src=self.target_source).wait()
+            dist.irecv(target,
+                       src=self.target_source,
+                       group=self.target_group).wait()
             patches = target
 
         z = self.mae.final(z)
