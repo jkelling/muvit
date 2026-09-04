@@ -323,6 +323,45 @@ class LossOnlyStage(nn.Module):
         return state
 
 
+def _encode_assemble_decode_all(mae, x_bbox):
+    """Encode, assemble and decode ALL level-decoders on a single stage.
+
+    Returns ``(z_all, patches)`` with ``z_all`` the concatenated decoded
+    tokens of every level (both gradients flow, so this is a valid DeepSpeed
+    cross-stage hand-off) and ``patches`` the input-derived target.
+    """
+    x, bbox = x_bbox
+    y, coords, patches, batch_range, idx_retain, idx_mask = _forward_masked(
+        mae, x, bbox)
+    for t in (y, coords, patches):
+        if t.dtype.is_floating_point and not t.requires_grad:
+            t = t.requires_grad_()
+    Ni = int(patches.shape[1])
+    npl = Ni // len(mae.encoder.levels)
+    z = _assemble_z(mae, y, coords, Ni, npl, batch_range, idx_retain, idx_mask)
+    z = _decode_levels(mae, z, coords, npl, 0, len(mae.encoder.levels))
+    return z.contiguous(), patches.contiguous()
+
+
+class EncoderAllDecodeStage(nn.Module):
+    """Boundary back: encode + assemble + decode ALL levels on stage 0.
+
+    Stage 1 (:class:`FinalLossStage`) projects the received tokens to patch
+    space and computes the loss. Only ``(z_all, patches)`` cross the pipeline,
+    so every cross-stage activation receives a gradient (DeepSpeed invariant).
+    """
+
+    def __init__(self, mae):
+        super().__init__()
+        self.mae = mae
+
+    def drain(self):
+        return
+
+    def forward(self, x_bbox):
+        return _encode_assemble_decode_all(self.mae, x_bbox)
+
+
 class EncoderAllDecodeFinalStage(nn.Module):
     """Balanced 2-stage stage 0: entire model except the loss.
 
@@ -340,19 +379,8 @@ class EncoderAllDecodeFinalStage(nn.Module):
         return
 
     def forward(self, x_bbox):
-        x, bbox = x_bbox
-        y, coords, patches, batch_range, idx_retain, idx_mask = _forward_masked(
-            self.mae, x, bbox)
-        for t in (y, coords, patches):
-            if t.dtype.is_floating_point and not t.requires_grad:
-                t = t.requires_grad_()
-        Ni = int(patches.shape[1])
-        npl = Ni // len(self.mae.encoder.levels)
-        z = _assemble_z(self.mae, y, coords, Ni, npl, batch_range, idx_retain,
-                        idx_mask)
-        z = _decode_levels(self.mae, z, coords, npl, 0,
-                           len(self.mae.encoder.levels))
-        return self.mae.final(z).contiguous(), patches.contiguous()
+        z, patches = _encode_assemble_decode_all(self.mae, x_bbox)
+        return self.mae.final(z).contiguous(), patches
 
 
 class FinalLossStage(nn.Module):
@@ -439,8 +467,9 @@ def build_mae3d_pipeline(mae, num_stages: int):
             return [EncoderHalfDecodeStage(mae, first),
                     HalfDecodeFinalStage(mae, first)]
         if (is_multi and n_levels >= 2 and first == n_levels):
-            return [EncoderHalfDecodeStage(mae, first),
-                    HalfDecodeFinalStage(mae, first)]
+            # Whole decoder on stage 0; only the final patch projection + loss
+            # stay on stage 1.
+            return [EncoderAllDecodeStage(mae), FinalLossStage(mae)]
         return [EncoderStage(mae), DecodeFinalStage(mae)]
     if num_stages == 3:
         return [EncoderStage(mae), AssembleDecodeStage(mae), FinalLossStage(mae)]
