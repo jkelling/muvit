@@ -255,8 +255,12 @@ class MuViTEncoder(SaveableModel, ABC, Generic[T]):
             if masking_mode == "dirichlet":
                 # alpha_parameter = 1.0
                 alpha_parameter = 0.5
+                # validate_args=False keeps sampling a pure CUDA op; the default
+                # True runs _validate_sample which does bool(tensor) on the GPU
+                # scalar and forces a host-GPU sync on every microbatch.
                 prob_weights = torch.distributions.Dirichlet(
-                    torch.ones(len(self.levels), device=x.device) * alpha_parameter
+                    torch.ones(len(self.levels), device=x.device) * alpha_parameter,
+                    validate_args=False,
                 ).sample()
             elif masking_mode == "random":
                 prob_weights = torch.ones(len(self.levels), device=x.device)
