@@ -319,6 +319,14 @@ class LossOnlyStage(nn.Module):
     stage 1 only performs the loss computation.
     """
 
+    def __init__(self):
+        super().__init__()
+        # DeepSpeed's engine init expects every stage to own at least one
+        # trainable parameter (optimizer/param-group setup syncs across
+        # stages); keep a scalar placeholder so a loss-only final stage does
+        # not deadlock the pipeline engine.
+        self._placeholder = nn.Parameter(torch.zeros(()))
+
     def forward(self, state):
         return state
 
