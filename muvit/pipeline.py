@@ -252,6 +252,11 @@ class EncoderHalfDecodeStage(nn.Module):
         self.mae = mae
         self.first = first
 
+    def drain(self):
+        # No explicit async target sends on this stage; hook kept for the
+        # driver's uniform input-stage drain() call.
+        return
+
     def forward(self, x_bbox):
         x, bbox = x_bbox
         y, coords, patches, batch_range, idx_retain, idx_mask = _forward_masked(
