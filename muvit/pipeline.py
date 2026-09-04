@@ -50,6 +50,33 @@ __all__ = [
 ]
 
 
+import os as _os
+
+# Stage-boundary option for the 2-stage layout: how many level-decoders are
+# pulled onto the *input* stage (stage 0) of a 2-stage pipeline.
+#   MUVIT_PIPE_BOUNDARY:
+#      '' / 'auto' / 'balanced' -> ceil(L/2) if decoder_mode is multi/multi_iso
+#                                 and there are >= 2 levels, else 0 (old layout)
+#      <int k>                    -> exactly k levels on stage 0 (0 = old layout
+#                                    with the whole decoder on stage 1; L = whole
+#                                    decoder on stage 0)
+# The remaining levels are decoded on stage 1 together with the final
+# projection and the loss.
+def _boundary_levels(mae):
+    n_levels = len(mae.encoder.levels)
+    raw = _os.environ.get("MUVIT_PIPE_BOUNDARY", "").strip()
+    if raw.lower() in ("", "auto", "balanced", "half"):
+        return ((n_levels + 1) // 2
+                if (mae.decoder_mode in ("multi", "multi_iso")) else 0)
+    try:
+        k = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"MUVIT_PIPE_BOUNDARY must be an integer level count or "
+            f"'auto', got {raw!r}.")
+    return max(0, min(k, n_levels))
+
+
 def _forward_masked(mae, x, bbox):
     """Run the encoder's masked forward, mirroring MuViTMAE3d.forward."""
     return mae.encoder.forward_masked(
@@ -335,11 +362,15 @@ def build_mae3d_pipeline(mae, num_stages: int):
     Raises ``ValueError`` for unsupported stage counts.
     """
     if num_stages == 2:
+        # The 2-stage boundary can be moved via MUVIT_PIPE_BOUNDARY (see
+        # _boundary_levels): by default the level-decoders are split evenly so
+        # encode+assemble+half the decoding run on stage 0 and the remaining
+        # decoding + final + loss on stage 1. Boundary 0/L fall back to the
+        # conventional encoder-only / decoder-only layout.
+        first = _boundary_levels(mae)
         n_levels = len(mae.encoder.levels)
-        if (mae.decoder_mode in ("multi", "multi_iso") and n_levels >= 2):
-            # Balanced boundary: encode+assemble+first level-decoders on stage 0,
-            # remaining level-decoders+final+loss on stage 1.
-            first = (n_levels + 1) // 2
+        if (mae.decoder_mode in ("multi", "multi_iso") and n_levels >= 2
+                and 0 < first < n_levels):
             return [EncoderHalfDecodeStage(mae, first),
                     HalfDecodeFinalStage(mae, first)]
         return [EncoderStage(mae), DecodeFinalStage(mae)]
