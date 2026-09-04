@@ -121,13 +121,14 @@ class EncoderStage(nn.Module):
         for t in (y, coords, patches):
             if t.dtype.is_floating_point and not t.requires_grad:
                 t = t.requires_grad_()
-        N = torch.tensor(patches.shape[1], device=y.device, dtype=torch.long)
         # DeepSpeed's inter-stage activation P2P requires dense, non-overlapping
         # tensors (the encoder output contains advanced-indexing views), so make
         # everything contiguous before handing it across the pipeline. `patches`
         # are carried so the last stage can compute MSE(input, output) with a
-        # target that is consistent across ranks by construction.
-        return (y.contiguous(), coords.contiguous(), patches.contiguous(), N,
+        # target that is consistent across ranks by construction. Token counts
+        # are NOT transported: downstream stages derive N/npl from tensor
+        # ``.shape`` (metadata, no host sync), avoiding ``Tensor.item()``.
+        return (y.contiguous(), coords.contiguous(), patches.contiguous(),
                 batch_range.contiguous(), idx_retain.contiguous(),
                 idx_mask.contiguous())
 
@@ -164,14 +165,12 @@ class AssembleStage(nn.Module):
         self.device = None
 
     def forward(self, enc_state):
-        y, coords, patches, N, batch_range, idx_retain, idx_mask = enc_state
-        Ni = int(N.item())
+        y, coords, patches, batch_range, idx_retain, idx_mask = enc_state
+        Ni = patches.shape[1]
         N_per_level = Ni // len(self.mae.encoder.levels)
         z = _assemble_z(self.mae, y, coords, Ni, N_per_level, batch_range,
                         idx_retain, idx_mask)
-        return (z, coords, patches,
-                torch.tensor(N_per_level, device=y.device, dtype=torch.long),
-                batch_range, idx_mask)
+        return z, coords, patches, batch_range, idx_mask
 
 
 
@@ -208,8 +207,8 @@ class DecodeStage(nn.Module):
         self.mae = mae
 
     def forward(self, state):
-        z, coords, patches, N_per_level, _batch_range, _idx_mask = state
-        npl = int(N_per_level.item())
+        z, coords, patches, _batch_range, _idx_mask = state
+        npl = z.shape[1] // len(self.mae.encoder.levels)
         if self.mae.decoder_mode == "single":
             z = self.mae.decoder(z, coords)
         elif self.mae.decoder_mode == "multi":
@@ -270,9 +269,8 @@ class EncoderHalfDecodeStage(nn.Module):
                         idx_mask)
         zA = _decode_levels(self.mae, z, coords, npl, 0, self.first)
         return (zA.contiguous(), z.contiguous(), coords.contiguous(),
-                patches.contiguous(),
-                torch.tensor(npl, device=y.device, dtype=torch.long),
-                batch_range.contiguous(), idx_mask.contiguous())
+                patches.contiguous(), batch_range.contiguous(),
+                idx_mask.contiguous())
 
 
 class HalfDecodeFinalStage(nn.Module):
@@ -289,8 +287,8 @@ class HalfDecodeFinalStage(nn.Module):
         self.first = first
 
     def forward(self, state):
-        zA, z, coords, patches, N_per_level, _batch_range, _idx_mask = state
-        npl = int(N_per_level.item())
+        zA, z, coords, patches, _batch_range, _idx_mask = state
+        npl = z.shape[1] // len(self.mae.encoder.levels)
         zB = _decode_levels(self.mae, z, coords, npl, self.first,
                             len(self.mae.encoder.levels))
         z = torch.cat([zA, zB], dim=1)
