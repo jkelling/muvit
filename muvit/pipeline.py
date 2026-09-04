@@ -147,6 +147,32 @@ class AssembleStage(nn.Module):
                 batch_range, idx_mask)
 
 
+
+def _decode_levels(mae, z, coords, npl, start, stop):
+    """Run MAE decoders for levels [start, stop) and concatenate their tokens.
+
+    Under ``multi``/``multi_iso`` decoding each level attends over the *full*
+    assembled token tensor ``z``/``coords`` (cross-attention to all levels), so
+    individual levels can be decoded on different pipeline stages and the
+    per-level outputs concatenated afterwards. ``npl`` = tokens per level.
+    """
+    zs = torch.split(z, npl, dim=1)
+    cs = torch.split(coords, npl, dim=1)
+    out = []
+    mode = mae.decoder_mode
+    for i in range(start, stop):
+        if mode == "multi":
+            out.append(mae.decoder[i](zs[i], cs[i], context=z,
+                                      context_coords=coords))
+        elif mode == "multi_iso":
+            out.append(mae.decoder[i](zs[i], cs[i]))
+        else:
+            raise ValueError(
+                f"Level-split decoding requires decoder_mode multi or "
+                f"multi_iso, got {mode!r}.")
+    return torch.cat(out, dim=1)
+
+
 class DecodeStage(nn.Module):
     """Pipeline stage: run the MAE decoder(s); returns ``(decoded, patches)``."""
 
@@ -180,6 +206,63 @@ class DecodeStage(nn.Module):
         else:
             raise ValueError(f"Invalid decoder mode: {self.mae.decoder_mode}")
         return z, patches
+
+
+
+class EncoderHalfDecodeStage(nn.Module):
+    """Balanced 2-stage stage 0: encode + assemble + decoder levels [0, first).
+
+    Keeps half of the (parallel) level-decoders on the input stage so the
+    compute load is shared between the two GBU stages instead of pushing the
+    whole decoder onto stage 1 (GPU1 100% vs GPU0 ~0%).
+    Outputs: ``(zA, z, coords, patches, N_per_level, batch_range, idx_mask)``
+    where ``zA`` are the decoded tokens of the first ``first`` levels and ``z``
+    is the full assembled token tensor still needed by the remaining levels.
+    """
+
+    def __init__(self, mae, first):
+        super().__init__()
+        self.mae = mae
+        self.first = first
+
+    def forward(self, x_bbox):
+        x, bbox = x_bbox
+        y, coords, patches, batch_range, idx_retain, idx_mask = _forward_masked(
+            self.mae, x, bbox)
+        for t in (y, coords, patches):
+            if t.dtype.is_floating_point and not t.requires_grad:
+                t = t.requires_grad_()
+        Ni = int(patches.shape[1])
+        npl = Ni // len(self.mae.encoder.levels)
+        z = _assemble_z(self.mae, y, coords, Ni, npl, batch_range, idx_retain,
+                        idx_mask)
+        zA = _decode_levels(self.mae, z, coords, npl, 0, self.first)
+        return (zA.contiguous(), z.contiguous(), coords.contiguous(),
+                patches.contiguous(),
+                torch.tensor(npl, device=y.device, dtype=torch.long),
+                batch_range.contiguous(), idx_mask.contiguous())
+
+
+class HalfDecodeFinalStage(nn.Module):
+    """Balanced 2-stage stage 1: decoder levels [first, L) + final + loss.
+
+    Decodes the remaining levels (cross-attending over the full ``z``/``coords``
+    received from stage 0), concatenates with ``zA`` and returns the projected
+    tokens and the target patches for :func:`mae_pipeline_loss`.
+    """
+
+    def __init__(self, mae, first):
+        super().__init__()
+        self.mae = mae
+        self.first = first
+
+    def forward(self, state):
+        zA, z, coords, patches, N_per_level, _batch_range, _idx_mask = state
+        npl = int(N_per_level.item())
+        zB = _decode_levels(self.mae, z, coords, npl, self.first,
+                            len(self.mae.encoder.levels))
+        z = torch.cat([zA, zB], dim=1)
+        return self.mae.final(z), patches
 
 
 class FinalLossStage(nn.Module):
@@ -252,6 +335,13 @@ def build_mae3d_pipeline(mae, num_stages: int):
     Raises ``ValueError`` for unsupported stage counts.
     """
     if num_stages == 2:
+        n_levels = len(mae.encoder.levels)
+        if (mae.decoder_mode in ("multi", "multi_iso") and n_levels >= 2):
+            # Balanced boundary: encode+assemble+first level-decoders on stage 0,
+            # remaining level-decoders+final+loss on stage 1.
+            first = (n_levels + 1) // 2
+            return [EncoderHalfDecodeStage(mae, first),
+                    HalfDecodeFinalStage(mae, first)]
         return [EncoderStage(mae), DecodeFinalStage(mae)]
     if num_stages == 3:
         return [EncoderStage(mae), AssembleDecodeStage(mae), FinalLossStage(mae)]
