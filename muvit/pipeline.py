@@ -57,14 +57,23 @@ import os as _os
 #   MUVIT_PIPE_BOUNDARY:
 #      '' / 'auto' / 'balanced' -> ceil(L/2) if decoder_mode is multi/multi_iso
 #                                 and there are >= 2 levels, else 0 (old layout)
-#      <int k>                    -> exactly k levels on stage 0 (0 = old layout
-#                                    with the whole decoder on stage 1; L = whole
-#                                    decoder on stage 0)
+#      <int k>                   -> exactly k levels on stage 0 (0 = old layout
+#                                   with the whole decoder on stage 1; L =
+#                                   whole decoder on stage 0, only final + loss
+#                                   on stage 1)
+#      'loss' / 'all' / 'last' / 'model' -> move the boundary all the way back:
+#                                   the WHOLE model runs on stage 0 and only
+#                                   the loss is computed on stage 1
 # The remaining levels are decoded on stage 1 together with the final
 # projection and the loss.
+_LOSS_ONLY = "LOSS_ONLY"
+
+
 def _boundary_levels(mae):
     n_levels = len(mae.encoder.levels)
     raw = _os.environ.get("MUVIT_PIPE_BOUNDARY", "").strip()
+    if raw.lower() in ("loss", "all", "last", "model"):
+        return _LOSS_ONLY
     if raw.lower() in ("", "auto", "balanced", "half"):
         return ((n_levels + 1) // 2
                 if (mae.decoder_mode in ("multi", "multi_iso")) else 0)
@@ -72,8 +81,8 @@ def _boundary_levels(mae):
         k = int(raw)
     except ValueError:
         raise ValueError(
-            f"MUVIT_PIPE_BOUNDARY must be an integer level count or "
-            f"'auto', got {raw!r}.")
+            f"MUVIT_PIPE_BOUNDARY must be an integer level count, 'auto' or "
+            f"'loss', got {raw!r}.")
     return max(0, min(k, n_levels))
 
 
@@ -289,10 +298,61 @@ class HalfDecodeFinalStage(nn.Module):
     def forward(self, state):
         zA, z, coords, patches, _batch_range, _idx_mask = state
         npl = z.shape[1] // len(self.mae.encoder.levels)
-        zB = _decode_levels(self.mae, z, coords, npl, self.first,
-                            len(self.mae.encoder.levels))
-        z = torch.cat([zA, zB], dim=1)
+        if self.first >= len(self.mae.encoder.levels):
+            # Boundary moved all level-decoders onto stage 0: nothing left to
+            # decode here, just project the tokens received from stage 0.
+            z = zA
+        else:
+            zB = _decode_levels(self.mae, z, coords, npl, self.first,
+                                len(self.mae.encoder.levels))
+            z = torch.cat([zA, zB], dim=1)
         return self.mae.final(z), patches
+
+
+class LossOnlyStage(nn.Module):
+    """Pipeline final stage: only the reconstruction loss is computed here.
+
+    Receives ``(z, patches)`` (the decoder output already projected to patch
+    space by the input stage) and passes them through unchanged; DeepSpeed
+    applies :func:`mae_pipeline_loss` (MSE) to the last stage output. Used for
+    the 'boundary fully back' layout where the whole model runs on stage 0 and
+    stage 1 only performs the loss computation.
+    """
+
+    def forward(self, state):
+        return state
+
+
+class EncoderAllDecodeFinalStage(nn.Module):
+    """Balanced 2-stage stage 0: entire model except the loss.
+
+    Encodes, assembles, decodes ALL level-decoders and runs the final patch
+    projection on the input stage; only the scalar MSE loss stays on stage 1
+    (:class:`LossOnlyStage` + :func:`mae_pipeline_loss`). Outputs
+    ``(z, patches)`` with ``z`` the (differentiable) projected decoder tokens.
+    """
+
+    def __init__(self, mae):
+        super().__init__()
+        self.mae = mae
+
+    def drain(self):
+        return
+
+    def forward(self, x_bbox):
+        x, bbox = x_bbox
+        y, coords, patches, batch_range, idx_retain, idx_mask = _forward_masked(
+            self.mae, x, bbox)
+        for t in (y, coords, patches):
+            if t.dtype.is_floating_point and not t.requires_grad:
+                t = t.requires_grad_()
+        Ni = int(patches.shape[1])
+        npl = Ni // len(self.mae.encoder.levels)
+        z = _assemble_z(self.mae, y, coords, Ni, npl, batch_range, idx_retain,
+                        idx_mask)
+        z = _decode_levels(self.mae, z, coords, npl, 0,
+                           len(self.mae.encoder.levels))
+        return self.mae.final(z).contiguous(), patches.contiguous()
 
 
 class FinalLossStage(nn.Module):
@@ -366,14 +426,19 @@ def build_mae3d_pipeline(mae, num_stages: int):
     """
     if num_stages == 2:
         # The 2-stage boundary can be moved via MUVIT_PIPE_BOUNDARY (see
-        # _boundary_levels): by default the level-decoders are split evenly so
-        # encode+assemble+half the decoding run on stage 0 and the remaining
-        # decoding + final + loss on stage 1. Boundary 0/L fall back to the
-        # conventional encoder-only / decoder-only layout.
-        first = _boundary_levels(mae)
+        # _boundary_levels): from 0 (encode only + whole decoder/final/loss on
+        # stage 1) through balanced (half the level-decoders on each stage) to
+        # L (whole decoder on stage 0, only final+loss on stage 1) and
+        # 'loss' (the whole model on stage 0, only the loss on stage 1).
         n_levels = len(mae.encoder.levels)
-        if (mae.decoder_mode in ("multi", "multi_iso") and n_levels >= 2
-                and 0 < first < n_levels):
+        is_multi = mae.decoder_mode in ("multi", "multi_iso")
+        first = _boundary_levels(mae)
+        if first == _LOSS_ONLY:
+            return [EncoderAllDecodeFinalStage(mae), LossOnlyStage(mae)]
+        if (is_multi and n_levels >= 2 and 0 < first < n_levels):
+            return [EncoderHalfDecodeStage(mae, first),
+                    HalfDecodeFinalStage(mae, first)]
+        if (is_multi and n_levels >= 2 and first == n_levels):
             return [EncoderHalfDecodeStage(mae, first),
                     HalfDecodeFinalStage(mae, first)]
         return [EncoderStage(mae), DecodeFinalStage(mae)]
