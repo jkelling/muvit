@@ -434,7 +434,7 @@ def build_mae3d_pipeline(mae, num_stages: int):
         is_multi = mae.decoder_mode in ("multi", "multi_iso")
         first = _boundary_levels(mae)
         if first == _LOSS_ONLY:
-            return [EncoderAllDecodeFinalStage(mae), LossOnlyStage(mae)]
+            return [EncoderAllDecodeFinalStage(mae), LossOnlyStage()]
         if (is_multi and n_levels >= 2 and 0 < first < n_levels):
             return [EncoderHalfDecodeStage(mae, first),
                     HalfDecodeFinalStage(mae, first)]
