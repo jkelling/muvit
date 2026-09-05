@@ -659,7 +659,7 @@ def build_mae3d_pipeline(mae, num_stages: int):
 
     Raises ``ValueError`` for unsupported stage counts.
     """
-    if _os.environ.get("MUVIT_PIPE_SPLIT") == "blocks":
+    if getattr(mae, "_pipeline_split", None) == "blocks":
         return build_mae3d_pipeline_blocks(mae, num_stages)
 
     if num_stages == 2:
