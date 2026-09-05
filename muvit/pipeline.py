@@ -49,7 +49,6 @@ __all__ = [
     "DecodeFinalStage",
 ]
 
-
 import os as _os
 
 # Stage-boundary option for the 2-stage layout: how many level-decoders are
@@ -75,8 +74,8 @@ def _boundary_levels(mae):
     if raw.lower() in ("loss", "all", "last", "model"):
         return _LOSS_ONLY
     if raw.lower() in ("", "auto", "balanced", "half"):
-        return ((n_levels + 1) // 2
-                if (mae.decoder_mode in ("multi", "multi_iso")) else 0)
+        return ((n_levels + 1) // 2 if
+                (mae.decoder_mode in ("multi", "multi_iso")) else 0)
     try:
         k = int(raw)
     except ValueError:
@@ -97,6 +96,142 @@ def _forward_masked(mae, x, bbox):
         None,
         masking_mode_is_ratio=False,
     )
+
+
+def _mask_select(mae, x, bbox):
+    """Replicate the encoder mask-selection prefix (patch_embed + masking +
+    retained-token selection) WITHOUT running any transformer layer, so the 6
+    encoder blocks can be executed on different pipeline stages.
+
+    Mirrors ``MuViTEncoder.forward_masked`` up to (but excluding) its
+    ``self.layers`` loop. Returns ``(x, level_idx, coords_sel, coords_full,
+    patches, batch_range, idx_retain, idx_mask)`` where ``x`` is the retained
+    token embeddings to feed encoder layer 0 and ``coords_full`` is the
+    unselected coords needed by the decode stages.
+    """
+    enc = mae.encoder
+    x, patches, coords = enc.patch_embed(x, bbox)
+    B, N, D = x.shape
+    npl = N // len(enc.levels)
+    level_idx = (torch.arange(
+        patches.shape[1], device=x.device).unsqueeze(0).repeat(B, 1) // npl)
+
+    masking_ratio = mae.masking_ratio
+    masking_mode = mae.masking_mode
+    N_retained = int(N * (1 - masking_ratio))
+    if masking_mode == "dirichlet":
+        prob_weights = torch.distributions.Dirichlet(
+            torch.ones(len(enc.levels), device=x.device) * 0.5,
+            validate_args=False).sample()
+    elif masking_mode == "random":
+        prob_weights = torch.ones(len(enc.levels), device=x.device)
+    elif isinstance(masking_mode, (tuple, list)):
+        prob_weights = torch.tensor(masking_mode, device=x.device)
+    else:
+        raise ValueError(f"Invalid masking mode: {masking_mode}")
+    prob_per_block = torch.repeat_interleave(prob_weights, npl)
+    idx = torch.stack([
+        torch.multinomial(prob_per_block, N, replacement=False)
+        for _ in range(B)
+    ],
+                      dim=0)
+    idx_retain, idx_mask = idx[:, :N_retained], idx[:, N_retained:]
+    batch_range = torch.arange(B, device=x.device)[:, None]
+    x = x[batch_range, idx_retain]
+    level_idx = level_idx[batch_range, idx_retain]
+    return (x, level_idx, coords[batch_range, idx_retain], coords, patches,
+            batch_range, idx_retain, idx_mask)
+
+
+def _contig_state(state):
+    out = []
+    for t in state:
+        if isinstance(t, torch.Tensor):
+            if t.dtype.is_floating_point and not t.requires_grad:
+                t = t.requires_grad_()
+            t = t.contiguous()
+        out.append(t)
+    return tuple(out)
+
+
+class _BlockStage(nn.Module):
+    """Transformer-block-granular MuViT pipeline stage.
+
+    One such module spans zero or more of: encoder transformer blocks, the
+    assemble step, per-level decoder blocks, and (on the last stage) the final
+    projection. ``spec`` is a dict with:
+
+      first : bool        -- stage consumes the raw ``(x, bbox)`` input
+      e0,e1 : int|None    -- encoder block range ``[e0, e1)`` (from the 6)
+      assemble : bool     -- run the mask-token assembly after the encoder
+      d0,d1  : int|None   -- decoder *level* range ``[d0, d1)``
+      final : bool        -- last stage: project ``final(z)`` (loss_fn follows)
+
+    Carry formats (all plain tuples of tensors):
+      8-tuple mid-encoder: (x, level_idx, coords_sel, coords_full, patches,
+                            batch_range, idx_retain, idx_mask)
+      5-tuple assembled:   (z, coords_full, patches, batch_range, idx_mask)
+      6-tuple mid-decode:  (zA, z, coords_full, patches, batch_range, idx_mask)
+    """
+
+    def __init__(self, mae, spec):
+        super().__init__()
+        self.mae = mae
+        self.spec = spec
+
+    def forward(self, state):
+        s = self.spec
+        if s.get("first"):
+            x, bbox = state
+            st = _mask_select(self.mae, x, bbox)
+            e1 = s.get("e1", 0)
+            for layer in self.mae.encoder.layers[:e1]:
+                st = _run_enc_layer(self.mae, layer, st)
+        else:
+            st = list(state)
+        # remaining encoder blocks
+        if s.get("e0") is not None and not s.get("first"):
+            x, level_idx, coords_sel, coords_full, patches, br, ir, im = st
+            for layer in self.mae.encoder.layers[s["e0"]:s["e1"]]:
+                x = layer(x,
+                          level_idx=level_idx,
+                          coords=coords_sel,
+                          attention_mode=self.mae.encoder.attention_mode)
+            st = [x, level_idx, coords_sel, coords_full, patches, br, ir, im]
+        # assemble (end of encoder phase)
+        if s.get("assemble"):
+            x, _lvl, csel, coords_full, patches, br, ir, im = st
+            Ni = patches.shape[1]
+            npl = Ni // len(self.mae.encoder.levels)
+            z = _assemble_z(self.mae, x, coords_full, Ni, npl, br, ir, im)
+            st = [z, coords_full, patches, br, im]
+        # decoder levels
+        if s.get("d0") is not None:
+            if len(st) == 5:
+                z, coords_full, patches, br, im = st
+                zA = None
+            else:
+                zA, z, coords_full, patches, br, im = st
+            npl = z.shape[1] // len(self.mae.encoder.levels)
+            chunk = _decode_levels(self.mae, z, coords_full, npl, s["d0"],
+                                   s["d1"])
+            zA = chunk if zA is None else torch.cat([zA, chunk], dim=1)
+            if s.get("final"):
+                return (self.mae.final(zA).contiguous(), patches.contiguous())
+            st = [zA, z, coords_full, patches, br, im]
+        if s.get("final"):
+            z, coords_full, patches, br, im = st
+            return (self.mae.final(z).contiguous(), patches.contiguous())
+        return _contig_state(st)
+
+
+def _run_enc_layer(mae, layer, st):
+    x, level_idx, coords_sel, coords_full, patches, br, ir, im = st
+    x = layer(x,
+              level_idx=level_idx,
+              coords=coords_sel,
+              attention_mode=mae.encoder.attention_mode)
+    return (x, level_idx, coords_sel, coords_full, patches, br, ir, im)
 
 
 class EncoderStage(nn.Module):
@@ -157,7 +292,8 @@ def _assemble_z(mae, y, coords, N, N_per_level, batch_range, idx_retain,
         z[batch_range, idx_mask] = mae.mask_token
         z[batch_range, idx_retain] = y
     else:  # "multi" / "multi_iso"
-        mask_tokens = torch.repeat_interleave(mae.mask_token, N_per_level,
+        mask_tokens = torch.repeat_interleave(mae.mask_token,
+                                              N_per_level,
                                               dim=1).repeat(y.shape[0], 1, 1)
         z[batch_range, idx_mask] = mask_tokens[batch_range, idx_mask]
         z[batch_range, idx_retain] = y
@@ -182,7 +318,6 @@ class AssembleStage(nn.Module):
         return z, coords, patches, batch_range, idx_mask
 
 
-
 def _decode_levels(mae, z, coords, npl, start, stop):
     """Run MAE decoders for levels [start, stop) and concatenate their tokens.
 
@@ -197,7 +332,9 @@ def _decode_levels(mae, z, coords, npl, start, stop):
     mode = mae.decoder_mode
     for i in range(start, stop):
         if mode == "multi":
-            out.append(mae.decoder[i](zs[i], cs[i], context=z,
+            out.append(mae.decoder[i](zs[i],
+                                      cs[i],
+                                      context=z,
                                       context_coords=coords))
         elif mode == "multi_iso":
             out.append(mae.decoder[i](zs[i], cs[i]))
@@ -225,7 +362,8 @@ class DecodeStage(nn.Module):
             cs = torch.split(coords, npl, dim=1)
             z = torch.cat(
                 [
-                    self.mae.decoder[i](_z, _c, context=z, context_coords=coords)
+                    self.mae.decoder[i](
+                        _z, _c, context=z, context_coords=coords)
                     for i, (_z, _c) in enumerate(zip(zs, cs))
                 ],
                 dim=1,
@@ -234,14 +372,15 @@ class DecodeStage(nn.Module):
             zs = torch.split(z, npl, dim=1)
             cs = torch.split(coords, npl, dim=1)
             z = torch.cat(
-                [self.mae.decoder[i](_z, _c)
-                 for i, (_z, _c) in enumerate(zip(zs, cs))],
+                [
+                    self.mae.decoder[i](_z, _c)
+                    for i, (_z, _c) in enumerate(zip(zs, cs))
+                ],
                 dim=1,
             )
         else:
             raise ValueError(f"Invalid decoder mode: {self.mae.decoder_mode}")
         return z, patches
-
 
 
 class EncoderHalfDecodeStage(nn.Module):
@@ -451,6 +590,63 @@ class DecodeFinalStage(nn.Module):
         return self.final(self.decode(self.assemble(enc_state)))
 
 
+def _block_specs(mae, num_stages):
+    """Contiguous transformer-block partition specs for ``_BlockStage``.
+
+    Units: P (patch_embed+mask select), E_i (encoder blocks), A (assemble),
+    D_i (per-level decoder groups), F (final). The list is split into
+    ``num_stages`` contiguous, near-equal slices — every boundary falls between
+    whole transformer blocks. The assembly step A lands inside the slice that
+    also carries the last encoder block E_{n-1} for these sizes, so no stage is
+    left with only trivial (~zero load) work; F is on the last slice with its
+    decoder group + the (cheap) loss.
+    """
+    n_lvl = len(mae.encoder.levels)
+    units = (["P"] + [f"E{i}" for i in range(len(mae.encoder.layers))] +
+             ["A"] + [f"D{i}" for i in range(n_lvl)] + ["F"])
+    L = len(units)
+    base, rem = divmod(L, num_stages)
+    sizes = [base + 1] * rem + [base] * (num_stages - rem)
+    specs = []
+    cut = 0
+    for sz in sizes:
+        seg = units[cut:cut + sz]
+        cut += sz
+        spec = {}
+        e = [int(u[1:]) for u in seg if u.startswith("E")]
+        d = [int(u[1:]) for u in seg if u.startswith("D")]
+        if "P" in seg:
+            spec["first"] = True
+            spec["e1"] = len(e)  # first stage runs encoder layers [0, len(e))
+        elif e:
+            spec["e0"] = min(e)
+            spec["e1"] = max(e) + 1
+        if "A" in seg:
+            spec["assemble"] = True
+        if d:
+            spec["d0"] = min(d)
+            spec["d1"] = max(d) + 1
+        if "F" in seg:
+            spec["final"] = True
+        specs.append(spec)
+    return specs
+
+
+def build_mae3d_pipeline_blocks(mae, num_stages: int):
+    """Transformer-block-granular MuViT pipeline stages (2/3/4).
+
+    Splits the 6 encoder blocks and the per-level decoder blocks across the
+    stages at whole-transformer-block boundaries (see ``_block_specs``), so
+    every stage -- including the last, which does decoder + `final` + loss --
+    carries real work.
+    """
+    if num_stages not in (2, 3, 4):
+        raise ValueError(
+            f"MuViT block pipeline supports num_stages in (2, 3, 4), got "
+            f"{num_stages}.")
+    return [_BlockStage(mae, sp) for sp in _block_specs(mae, num_stages)]
+
+
 def build_mae3d_pipeline(mae, num_stages: int):
     """Return ``num_stages`` callable pipeline stages for a ``MuViTMAE3d``.
 
@@ -460,6 +656,9 @@ def build_mae3d_pipeline(mae, num_stages: int):
 
     Raises ``ValueError`` for unsupported stage counts.
     """
+    if _os.environ.get("MUVIT_PIPE_SPLIT") == "blocks":
+        return build_mae3d_pipeline_blocks(mae, num_stages)
+
     if num_stages == 2:
         # The 2-stage boundary can be moved via MUVIT_PIPE_BOUNDARY (see
         # _boundary_levels): from 0 (encode only + whole decoder/final/loss on
@@ -472,17 +671,28 @@ def build_mae3d_pipeline(mae, num_stages: int):
         if first == _LOSS_ONLY:
             return [EncoderAllDecodeFinalStage(mae), LossOnlyStage()]
         if (is_multi and n_levels >= 2 and 0 < first < n_levels):
-            return [EncoderHalfDecodeStage(mae, first),
-                    HalfDecodeFinalStage(mae, first)]
+            return [
+                EncoderHalfDecodeStage(mae, first),
+                HalfDecodeFinalStage(mae, first)
+            ]
         if (is_multi and n_levels >= 2 and first == n_levels):
             # Whole decoder on stage 0; only the final patch projection + loss
             # stay on stage 1.
             return [EncoderAllDecodeStage(mae), FinalLossStage(mae)]
         return [EncoderStage(mae), DecodeFinalStage(mae)]
     if num_stages == 3:
-        return [EncoderStage(mae), AssembleDecodeStage(mae), FinalLossStage(mae)]
+        return [
+            EncoderStage(mae),
+            AssembleDecodeStage(mae),
+            FinalLossStage(mae)
+        ]
     if num_stages == 4:
-        return [EncoderStage(mae), AssembleStage(mae), DecodeStage(mae),
-                FinalLossStage(mae)]
+        return [
+            EncoderStage(mae),
+            AssembleStage(mae),
+            DecodeStage(mae),
+            FinalLossStage(mae)
+        ]
     raise ValueError(
-        f"MuViT MAE pipeline currently supports num_stages in (2, 3, 4), got {num_stages}.")
+        f"MuViT MAE pipeline currently supports num_stages in (2, 3, 4), got {num_stages}."
+    )
