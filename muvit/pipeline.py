@@ -179,6 +179,9 @@ class _BlockStage(nn.Module):
         self.mae = mae
         self.spec = spec
 
+    def drain(self):
+        return
+
     def forward(self, state):
         s = self.spec
         if s.get("first"):
